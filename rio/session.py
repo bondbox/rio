@@ -20,11 +20,10 @@ import introspection
 import ordered_set
 import revel
 import starlette.datastructures
-import typing_extensions as te
 import unicall
 import unicall.json_rpc
+import uniserde
 from identity_containers import IdentityDefaultDict, IdentitySet
-from uniserde import Jsonable, JsonDoc
 
 import rio
 
@@ -48,7 +47,7 @@ from . import (
 )
 from .components import dialog_container, fundamental_component, root_components
 from .data_models import BuildData, UnittestComponentLayout
-from .observables import Dataclass
+from .observables.dataclass import RioDataclassMeta
 from .observables.observable_property import AttributeBinding
 from .observables.session_attachments import SessionAttachments
 from .observables.session_property import SessionProperty
@@ -62,13 +61,14 @@ __all__ = ["Session"]
 
 
 T = t.TypeVar("T")
+P = t.ParamSpec("P")
 
 
 class WontSerialize(Exception):
     pass
 
 
-class Session(unicall.Unicall, Dataclass):
+class Session(unicall.Unicall, metaclass=RioDataclassMeta):
     """
     Represents a single client connection to the app.
 
@@ -336,12 +336,12 @@ class Session(unicall.Unicall, Dataclass):
 
         # Modifying a setting starts this task that waits a little while and
         # then saves the settings
-        self._settings_save_task: asyncio.Task | None = None
+        self._settings_save_task: asyncio.Task[None] | None = None
 
         # If `running_in_window`, this contains all the settings loaded from the
         # json file. We need to keep this around so that we can update the
         # settings that have changed and write everything back to the file.
-        self._settings_json: JsonDoc = {}
+        self._settings_json: uniserde.JsonDoc = {}
 
         # If `running_in_window`, this is the current content of the settings
         # file. This is used to avoid needlessly re-writing the file if nothing
@@ -472,17 +472,6 @@ class Session(unicall.Unicall, Dataclass):
         # `_refresh_whenever_necessary()` task. That's because it has to happen
         # *after* all the other Session initialization (like loading user
         # settings) is done.
-
-    # This method is inherited from dataclasses but not meant to be public
-    @te.override
-    def bind(self, *args, **kwargs) -> t.NoReturn:
-        """
-        ## Metadata
-
-        `public`: False
-        """
-
-        raise AttributeError()
 
     async def _refresh_whenever_necessary(self) -> None:
         while True:
@@ -1007,24 +996,8 @@ window.resizeTo(screen.availWidth, screen.availHeight);
         if refresh:
             await self._refresh()
 
-    @t.overload
     def _call_event_handler_sync(
-        self,
-        handler: utils.EventHandler[[]],
-    ) -> None: ...
-
-    @t.overload
-    def _call_event_handler_sync(
-        self,
-        handler: utils.EventHandler[[T]],
-        event_data: T,
-        /,
-    ) -> None: ...
-
-    def _call_event_handler_sync(
-        self,
-        handler: utils.EventHandler[...],
-        *event_data: object,
+        self, handler: utils.EventHandler[P], *args: P.args, **kwargs: P.kwargs
     ) -> None:
         """
         Calls an event handler function. If it returns an awaitable, it is
@@ -1041,7 +1014,7 @@ window.resizeTo(screen.availWidth, screen.availHeight);
 
         # Try to call the event handler synchronously
         try:
-            result = handler(*event_data)
+            result = handler(*args, **kwargs)
 
         # Display and discard exceptions
         except Exception:
@@ -1114,9 +1087,21 @@ window.resizeTo(screen.availWidth, screen.availHeight);
         task = asyncio.create_task(coro, name=name)
 
         self._running_tasks.add(task)
-        task.add_done_callback(self._running_tasks.remove)
+        task.add_done_callback(self._on_task_done)
 
         return task
+
+    def _on_task_done(self, task: asyncio.Task) -> None:
+        self._running_tasks.remove(task)
+
+        try:
+            error = task.exception()
+        except asyncio.CancelledError:
+            return
+
+        if error is not None:
+            revel.error("Background task crashed:")
+            traceback.print_exception(type(error), error, error.__traceback__)
 
     def _make_url_absolute(
         self,
@@ -1497,12 +1482,22 @@ window.location.href = {json.dumps(str(active_page_url))};
         # Inject the builder and build generation
         weak_builder = weakref.ref(component)
 
-        component_data.all_children_in_build_boundary = set(
-            component_data.build_result._iter_direct_and_indirect_child_containing_attributes_(
-                include_self=True,
-                recurse_into_high_level_components=False,
+        if isinstance(
+            component_data.build_result,
+            fundamental_component.FundamentalComponent,
+        ):
+            component_data.all_children_in_build_boundary = set(
+                component_data.build_result._iter_tree_children_(
+                    include_self=True,
+                    recurse_into_fundamental_components=True,
+                    recurse_into_high_level_components=False,
+                )
             )
-        )
+        else:
+            component_data.all_children_in_build_boundary = {
+                component_data.build_result
+            }
+
         for child in component_data.all_children_in_build_boundary:
             child._weak_builder_ = weak_builder
 
@@ -1541,7 +1536,9 @@ window.location.href = {json.dumps(str(active_page_url))};
         properties_to_serialize = collections.defaultdict[object, set[str]](set)
 
         # Keep track of of previous child components
-        old_children_in_build_boundary_for_visited_children = {}
+        old_children_in_build_boundary_for_visited_children = dict[
+            rio.Component, set[rio.Component]
+        ]()
 
         # Build all dirty components
         components_to_build = set[rio.Component]()
@@ -1702,10 +1699,24 @@ window.location.href = {json.dumps(str(active_page_url))};
                 continue
 
             all_children_old.update(
-                old_children_in_build_boundary_for_visited_children[component]
+                c
+                for comp in old_children_in_build_boundary_for_visited_children[
+                    component
+                ]
+                for c in comp._iter_tree_children_(
+                    include_self=True,
+                    recurse_into_fundamental_components=True,
+                    recurse_into_high_level_components=True,
+                )
             )
             all_children_new.update(
-                component._build_data_.all_children_in_build_boundary  # type: ignore
+                c
+                for comp in component._build_data_.all_children_in_build_boundary  # type: ignore
+                for c in comp._iter_tree_children_(
+                    include_self=True,
+                    recurse_into_fundamental_components=True,
+                    recurse_into_high_level_components=True,
+                )
             )
 
         # Find out which components were mounted or unmounted
@@ -1718,19 +1729,22 @@ window.location.href = {json.dumps(str(active_page_url))};
             mounted_components - visited_and_live_components
         )
 
-        while unvisited_mounted_components:
-            visited_and_live_components.update(unvisited_mounted_components)
+        for component in unvisited_mounted_components:
+            recursive_children = component._iter_tree_children_(
+                include_self=True,
+                recurse_into_fundamental_components=True,
+                recurse_into_high_level_components=True,
+            )
+            visited_and_live_components.update(recursive_children)
 
-            new_children = list[rio.Component]()
-            for component in unvisited_mounted_components:
-                if not isinstance(
-                    component, fundamental_component.FundamentalComponent
-                ):
-                    new_children += component._iter_component_tree_(
-                        include_root=False
-                    )
-
-            unvisited_mounted_components = new_children
+        # Make sure *all* properties of mounted components are sent to the
+        # frontend
+        for component in mounted_components:
+            properties_to_serialize[component] = set(
+                serialization.get_all_serializable_property_names(
+                    type(component)
+                )
+            )
 
         return (
             visited_and_live_components,
@@ -1772,7 +1786,7 @@ window.location.href = {json.dumps(str(active_page_url))};
                     return
 
                 # Serialize all components which have been visited
-                delta_states: dict[int, JsonDoc] = {
+                delta_states: dict[int, uniserde.JsonDoc] = {
                     component._id_: serialization.serialize_and_host_component(
                         component, properties_to_serialize[component]
                     )
@@ -1819,7 +1833,7 @@ window.location.href = {json.dumps(str(active_page_url))};
     async def _update_component_states(
         self,
         visited_components: set[rio.Component],
-        delta_states: dict[int, JsonDoc],
+        delta_states: dict[int, uniserde.JsonDoc],
     ) -> None:
         # Initialize all new FundamentalComponents
         for component in visited_components:
@@ -1866,12 +1880,16 @@ window.location.href = {json.dumps(str(active_page_url))};
 
             for (
                 component
-            ) in self._high_level_root_component._iter_component_tree_():
+            ) in self._high_level_root_component._iter_tree_children_(
+                include_self=True,
+                recurse_into_fundamental_components=True,
+                recurse_into_high_level_components=True,
+            ):
                 visited_components.add(component)
                 delta_states[component._id_] = (
                     serialization.serialize_and_host_component(
                         component,
-                        serialization.get_attribute_serializers(
+                        serialization.get_all_serializable_property_names(
                             type(component)
                         ),
                     )
@@ -1959,13 +1977,13 @@ window.location.href = {json.dumps(str(active_page_url))};
             if build_data is None:
                 continue
 
-            build_data.all_children_in_build_boundary.difference_update(
-                removed_children_by_builder[builder]
-            )
-            build_data.all_children_in_build_boundary.update(
-                reconciled_components_new_to_old.get(new_child, new_child)
-                for new_child in added_children
-            )
+            # build_data.all_children_in_build_boundary.difference_update(
+            #     removed_children_by_builder[builder]
+            # )
+            # build_data.all_children_in_build_boundary.update(
+            #     reconciled_components_new_to_old.get(new_child, new_child)
+            #     for new_child in added_children
+            # )
 
         # Update the component data. If the root component was not reconciled,
         # the new component is the new build result.
@@ -2010,9 +2028,9 @@ window.location.href = {json.dumps(str(active_page_url))};
 
             child._weak_builder_ = parent._weak_builder_
 
-            build_data = builder._build_data_
-            if build_data is not None:
-                build_data.all_children_in_build_boundary.add(child)
+            # build_data = builder._build_data_
+            # if build_data is not None:
+            #     build_data.all_children_in_build_boundary.add(child)
 
         # Replace any references to new reconciled components to old ones instead
         def remap_components(parent: rio.Component) -> None:
@@ -2300,9 +2318,7 @@ window.location.href = {json.dumps(str(active_page_url))};
         # Fonts are different from other assets because they need to be
         # registered under a name, not just a URL. We don't want to re-register
         # the same font multiple times, so we keep track of all registered
-        # fonts. Every registered font is associated with all its assets
-        # (regular, bold, italic, ...), which will be kept alive until the
-        # session is closed.
+        # fonts.
         try:
             return self._registered_font_names[font]
         except KeyError:
@@ -2314,31 +2330,27 @@ window.location.href = {json.dumps(str(active_page_url))};
                 random.choice(string.ascii_letters) for _ in range(10)
             )
 
-            if font_name not in self._registered_font_names:
+            if font_name not in self._registered_font_names.values():
                 break
 
-        # Register the font files as assets
-        font_assets: list[assets.Asset] = []
-        urls: list[str | None] = [None] * 4
-
-        for i, location in enumerate(
-            (font.regular, font.bold, font.italic, font.bold_italic)
-        ):
-            if location is None:
-                continue
-
-            # Host the font file as an asset
-            asset = assets.Asset.new(location)
-            urls[i] = asset._serialize(self)
-
-            font_assets.append(asset)
-
-        self.create_task(self._remote_register_font(font_name, urls))  # type: ignore
-
         self._registered_font_names[font] = font_name
-        self._registered_font_assets[font] = font_assets
+        self.create_task(
+            self._register_font_assets_and_remote_font(font, font_name)
+        )
 
         return font_name
+
+    async def _register_font_assets_and_remote_font(
+        self, font: text_style.Font, font_name: str
+    ):
+        font_faces = await self._app_server.register_font(font)
+
+        urls = [face.file._serialize(self) for face in font_faces]
+        file_metas = [face.file_meta for face in font_faces]
+        descriptors = [face.descriptors for face in font_faces]
+        await self._remote_register_font(
+            font_name, urls, file_metas, descriptors
+        )
 
     def _get_settings_file_path(self) -> pathlib.Path:
         """
@@ -2358,19 +2370,22 @@ window.location.href = {json.dumps(str(active_page_url))};
         )
 
     async def _load_user_settings(
-        self, settings_sent_by_client: JsonDoc
+        self, localstorage: uniserde.JsonDoc, cookies: t.Mapping[str, str]
     ) -> None:
         # If `running_in_window`, load the settings from the config file.
         # Otherwise, parse the settings sent by the browser.
-        #
-        # Keys in this dict can be attributes of the "root" section or names of
-        # sections. To prevent name clashes, section names are prefixed with
-        # "section:".
-        settings_json: JsonDoc
+
+        localstorage_sections: dict[str, uniserde.JsonDoc] = (
+            collections.defaultdict(dict)
+        )
+        cookie_sections: dict[str, uniserde.JsonDoc] = collections.defaultdict(
+            dict
+        )
 
         if self.running_in_window:
             import aiofiles
 
+            settings_json: uniserde.JsonDoc
             try:
                 async with aiofiles.open(
                     self._get_settings_file_path()
@@ -2382,31 +2397,57 @@ window.location.href = {json.dumps(str(active_page_url))};
                 settings_json = {}
                 settings_text = "{}"
 
+            # Sections are saved as nested dictionaries where the key is
+            # prefixed with "section:". Values in the "default" section are
+            # saved directly in the root dict.
+            #
+            # We have to remove the "section:" prefixes and move all top-most
+            # settings into the "default" section.
+            for key, value in settings_json.items():
+                if key.startswith("section:"):
+                    section = key.removeprefix("section:")
+
+                    # If the value somehow isn't a dict, it's invalid. Just
+                    # ignore it in that case.
+                    if isinstance(value, dict):
+                        localstorage_sections[section] = value
+                else:
+                    localstorage_sections[""][key] = value
+
+            # In `window` mode, there's no distinction between localstorage and
+            # cookies. We'll just use the same dict for both.
+            cookie_sections = localstorage_sections
+
             self._settings_json = settings_json
             self._settings_json_string = settings_text
         else:
             # Browsers send us a flat dict where the keys are prefixed with the
             # section name. We will convert each section into a dict.
-            settings_json = {}
 
-            for key, value in settings_sent_by_client.items():
-                # Find the section name
-                section_name, _, key = key.rpartition(":")
+            # But first, convert the cookies from strings to json values.
+            parsed_cookies: uniserde.JsonDoc = {}
+            for key, value in cookies.items():
+                try:
+                    parsed_cookies[key] = json.loads(value)
+                except json.JSONDecodeError:
+                    pass
 
-                if section_name:
-                    section = t.cast(
-                        JsonDoc,
-                        settings_json.setdefault("section:" + section_name, {}),
-                    )
-                else:
-                    section = settings_json
+            for source_dict, target_dict in (
+                (localstorage, localstorage_sections),
+                (parsed_cookies, cookie_sections),
+            ):
+                for key, value in source_dict.items():
+                    section, _, key = key.rpartition(":")
+                    target_dict[section][key] = value
 
-                section[key] = value
-
-        self._load_user_settings_from_settings_json(settings_json)
+        self._load_user_settings_from_settings_json(
+            localstorage_sections, cookie_sections
+        )
 
     def _load_user_settings_from_settings_json(
-        self, settings_json: JsonDoc
+        self,
+        localstorage_sections: dict[str, uniserde.JsonDoc],
+        cookie_sections: dict[str, uniserde.JsonDoc],
     ) -> None:
         # Instantiate and attach the settings
         for default_settings in self._app_server.app.default_attachments:
@@ -2416,7 +2457,8 @@ window.location.href = {json.dumps(str(active_page_url))};
                 continue
 
             settings = type(default_settings)._from_json(
-                settings_json,
+                localstorage_sections,
+                cookie_sections,
                 default_settings,
             )
 
@@ -2463,8 +2505,9 @@ window.location.href = {json.dumps(str(active_page_url))};
 
         for settings, dirty_attributes in settings_to_save:
             if settings.section_name:
+                # Create a nested dict for this section
                 section = t.cast(
-                    JsonDoc,
+                    uniserde.JsonDoc,
                     self._settings_json.setdefault(
                         "section:" + settings.section_name, {}
                     ),
@@ -2501,6 +2544,7 @@ window.location.href = {json.dumps(str(active_page_url))};
         ],
     ) -> None:
         delta_settings: dict[str, t.Any] = {}
+        cookies: dict[str, str] = {}
 
         for settings, dirty_attributes in settings_to_save:
             prefix = (
@@ -2513,15 +2557,28 @@ window.location.href = {json.dumps(str(active_page_url))};
 
             # Get the dirty attributes
             for attr_name in dirty_attributes:
-                delta_settings[f"{prefix}{attr_name}"] = (
-                    serialization.json_serde.as_json(
-                        getattr(settings, attr_name),
-                        as_type=annotations[attr_name],
-                    )
+                key = f"{prefix}{attr_name}"
+                json_value = serialization.json_serde.as_json(
+                    getattr(settings, attr_name),
+                    as_type=annotations[attr_name],
                 )
 
+                if attr_name in settings._rio_attrs_to_save_as_cookies_:
+                    cookies[key] = json.dumps(json_value)
+                else:
+                    delta_settings[key] = json_value
+
         # Sync them with the client
-        await self._set_user_settings(delta_settings)
+        tasks = list[t.Awaitable]()
+
+        if delta_settings:
+            tasks.append(self._remote_set_user_settings(delta_settings))
+
+        if cookies:
+            url = self._app_server.url_for_cookies(cookies)
+            tasks.append(self._evaluate_javascript(f"fetch({url!r})"))
+
+        await asyncio.gather(*tasks)
 
     def _save_settings_soon(self) -> None:
         if self._settings_save_task is None:
@@ -2573,6 +2630,45 @@ window.location.href = {json.dumps(str(active_page_url))};
                     await asyncio.sleep(0.2)
         else:
             await self._remote_set_title(title)
+
+    async def pick_folder(self) -> pathlib.Path:
+        """
+        Open a folder picker dialog.
+
+        This function opens a folder picker dialog, allowing the user to pick a
+        folder. The path of the selected folder is returned.
+
+        This function can only be used in "app" mode. (i.e. not in the browser)
+
+
+        ## Parameters
+
+        `multiple`: Whether the user should pick a single folder, or multiple.
+
+
+        ## Raises
+
+        `NoFolderSelectedError`: If the user did not select a folder.
+        """
+
+        if not self.running_in_window:
+            raise Exception(
+                "`Session.pick_folder` can only be used in app mode"
+            )
+
+        from . import webview_shim
+
+        window = await self._get_webview_window()
+        selected_file_paths = window.create_file_dialog(
+            dialog_type=webview_shim.FileDialog.FOLDER,
+            # Note: The `allow_multiple` parameter seems to be ignored for
+            # folder dialogs :/
+        )
+
+        if not selected_file_paths:
+            raise errors.NoFolderSelectedError()
+
+        return pathlib.Path(selected_file_paths[0])
 
     @t.overload
     async def pick_file(
@@ -2658,7 +2754,7 @@ window.location.href = {json.dumps(str(active_page_url))};
 
         window = await self._get_webview_window()
         selected_file_paths = window.create_file_dialog(
-            dialog_type=webview_shim.OPEN_DIALOG,
+            dialog_type=webview_shim.FileDialog.OPEN,
             allow_multiple=multiple,
             file_types=file_types,
         )
@@ -2775,7 +2871,7 @@ window.location.href = {json.dumps(str(active_page_url))};
 
             window = await self._get_webview_window()
             destinations = window.create_file_dialog(
-                webview_shim.SAVE_DIALOG,
+                webview_shim.FileDialog.SAVE,
                 directory="" if directory is None else str(directory),
                 save_filename=file_name,
             )
@@ -2849,7 +2945,9 @@ a.remove();
 """
         )
 
-    def _serialize_fill(self, fill: fills._FillLike | None) -> Jsonable:
+    def _serialize_fill(
+        self, fill: fills._FillLike | None
+    ) -> uniserde.Jsonable:
         if fill is None:
             return None
 
@@ -3730,7 +3828,7 @@ a.remove();
         raise NotImplementedError  # pragma: no cover
 
     @unicall.remote(name="setUserSettings", await_response=False)
-    async def _set_user_settings(
+    async def _remote_set_user_settings(
         self, delta_settings: dict[str, t.Any]
     ) -> None:
         """
@@ -3744,7 +3842,11 @@ a.remove();
 
     @unicall.remote(name="registerFont", await_response=False)
     async def _remote_register_font(
-        self, name: str, urls: list[str | None]
+        self,
+        name: str,
+        urls: list[str],
+        file_metas: list[str],
+        descriptors: list[dict[str, str]],
     ) -> None:
         raise NotImplementedError  # pragma: no cover
 
@@ -3929,6 +4031,22 @@ a.remove();
                     self._call_event_handler(callback, component, refresh=True),
                     name="`on_on_window_size_change` event handler",
                 )
+
+    @unicall.local(name="onComponentSizeChange")
+    async def _on_component_size_change(
+        self, component_id: int, new_width: float, new_height: float
+    ) -> None:
+        """
+        Called by the client when a component is resized.
+        """
+        component = self._weak_components_by_id.get(component_id)
+        if component:
+            resize_event = rio.ComponentResizeEvent(new_width, new_height)
+
+            for handler, _ in component._rio_event_handlers_[
+                rio.event.EventTag.ON_RESIZE
+            ]:
+                self._call_event_handler_sync(handler, component, resize_event)
 
     @unicall.local(name="onFullscreenChange")
     async def _on_fullscreen_change(self, fullscreen: bool) -> None:

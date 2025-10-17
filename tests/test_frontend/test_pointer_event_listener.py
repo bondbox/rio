@@ -70,12 +70,74 @@ async def test_on_double_press_event(
     ids=lambda buttons: "/".join(buttons),
 )
 @pytest.mark.parametrize("pressed_button", ["left", "middle", "right"])
+@pytest.mark.parametrize("consume_events", [True, False])
+@pytest.mark.parametrize("capture_events", [True, False])
 async def test_specific_button_events(
     event_buttons: t.Sequence[t.Literal["left", "middle", "right"]],
     pressed_button: t.Literal["left", "middle", "right"],
+    consume_events: bool,
+    capture_events: bool,
 ) -> None:
+    down_events: list[rio.PointerEvent] = []
+    up_events: list[rio.PointerEvent] = []
+
+    def on_pointer_down(e: rio.PointerEvent):
+        down_events.append(e)
+
+    def on_pointer_up(e: rio.PointerEvent):
+        up_events.append(e)
+
+    def build():
+        return rio.PointerEventListener(
+            rio.PointerEventListener(
+                rio.Spacer(),
+                on_pointer_down={
+                    button: on_pointer_down for button in event_buttons
+                },
+                on_pointer_up={
+                    button: on_pointer_up for button in event_buttons
+                },
+            ),
+            on_pointer_down={
+                button: on_pointer_down for button in event_buttons
+            },
+            on_pointer_up={button: on_pointer_up for button in event_buttons},
+            consume_events=consume_events,
+            capture_events=capture_events,
+        )
+
+    async with BrowserClient(build) as client:
+        await client.click(0.5, 0.5, button=pressed_button, sleep=0.5)
+
+    if pressed_button in event_buttons:
+        assert len(down_events) == 1 + (capture_events and not consume_events)
+        assert len(up_events) == 1 + (capture_events and not consume_events)
+    else:
+        assert len(down_events) == 0
+        assert len(up_events) == 0
+
+
+@pytest.mark.parametrize("pressed_button", ["left", "middle", "right"])
+@pytest.mark.parametrize(
+    "build_child, child_eats_press_event, child_eats_pointer_events",
+    [
+        (rio.Spacer, False, []),
+        (rio.TextInput, True, ["left"]),
+    ],
+)
+async def test_event_propagation(
+    pressed_button: t.Literal["left", "middle", "right"],
+    build_child: t.Callable[[], rio.Component],
+    child_eats_press_event: bool,
+    child_eats_pointer_events: t.Sequence[str],
+) -> None:
+    press_event: rio.PointerEvent | None = None
     down_event: rio.PointerEvent | None = None
     up_event: rio.PointerEvent | None = None
+
+    def on_press(e: rio.PointerEvent):
+        nonlocal press_event
+        press_event = e
 
     def on_pointer_down(e: rio.PointerEvent):
         nonlocal down_event
@@ -87,17 +149,21 @@ async def test_specific_button_events(
 
     def build():
         return rio.PointerEventListener(
-            rio.Spacer(),
-            on_pointer_down={
-                button: on_pointer_down for button in event_buttons
-            },
-            on_pointer_up={button: on_pointer_up for button in event_buttons},
+            build_child(),
+            on_press=on_press,
+            on_pointer_down=on_pointer_down,
+            on_pointer_up=on_pointer_up,
         )
 
     async with BrowserClient(build) as client:
         await client.click(0.5, 0.5, button=pressed_button, sleep=0.5)
 
-    if pressed_button in event_buttons:
+    if pressed_button == "left" and not child_eats_press_event:
+        assert press_event is not None
+    else:
+        assert press_event is None
+
+    if pressed_button not in child_eats_pointer_events:
         assert down_event is not None
         assert up_event is not None
     else:

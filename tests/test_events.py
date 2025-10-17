@@ -2,7 +2,22 @@ import asyncio
 import typing as t
 
 import rio.testing
-from rio.components import Component
+from rio.debug.layouter import Layouter
+
+
+class ResizeEventRecorder(rio.Component):
+    recorded_events: list[rio.ComponentResizeEvent] = []
+
+    @rio.event.on_resize
+    def on_resize(self, resize_event: rio.ComponentResizeEvent) -> None:
+        self.recorded_events.append(resize_event)
+
+    def build(self):
+        return rio.Rectangle(
+            fill=rio.Color.BLUE,
+            min_width=5.0,
+            min_height=10.0,
+        )
 
 
 class ChildMounter(rio.Component):
@@ -40,7 +55,7 @@ class EventCounter(rio.Component):
     def _on_unmount(self):
         self.unmount_count += 1
 
-    def build(self) -> Component:
+    def build(self) -> rio.Component:
         return self.child
 
 
@@ -140,33 +155,40 @@ async def test_nested_unmount_and_remount():
         return ChildMounter(
             EventCounter(
                 ChildMounter(
-                    EventCounter(rio.Text("hello!")),
+                    EventCounter(
+                        rio.Text("hello!"),
+                        key="inner_counter",
+                    ),
                     child_mounted=True,
-                )
+                    key="inner_mounter",
+                ),
+                key="outer_counter",
             ),
             child_mounted=True,
+            key="outer_mounter",
         )
 
     async with rio.testing.DummyClient(build) as client:
-        mounter1, mounter2 = client.get_components(ChildMounter)
-        counter1, counter2 = client.get_components(EventCounter)
+        outer_mounter = client.get_component(ChildMounter, key="outer_mounter")
+        outer_counter = client.get_component(EventCounter, key="outer_counter")
+        inner_counter = client.get_component(EventCounter, key="inner_counter")
 
-        assert counter1.mount_count == 1
-        assert counter1.unmount_count == 0
-        assert counter2.mount_count == 1
-        assert counter2.unmount_count == 0
+        assert outer_counter.mount_count == 1
+        assert outer_counter.unmount_count == 0
+        assert inner_counter.mount_count == 1
+        assert inner_counter.unmount_count == 0
 
-        mounter1.child_mounted = False
+        outer_mounter.child_mounted = False
         await client.wait_for_refresh()
 
-        assert counter1.unmount_count == 1
-        assert counter2.unmount_count == 1
+        assert outer_counter.unmount_count == 1
+        assert inner_counter.unmount_count == 1
 
-        mounter1.child_mounted = True
+        outer_mounter.child_mounted = True
         await client.wait_for_refresh()
 
-        assert counter1.mount_count == 2
-        assert counter2.mount_count == 2
+        assert outer_counter.mount_count == 2
+        assert inner_counter.mount_count == 2
 
 
 async def test_refresh_after_synchronous_mount_handler():
@@ -259,3 +281,25 @@ async def test_populate_dead_child():
         assert not test_client._last_updated_components, (
             "Unmounted component was sent to the frontend"
         )
+
+
+async def test_size_observer_reports_content_dimensions():
+    async with rio.testing.BrowserClient(ResizeEventRecorder) as client:
+        resize_event_recorder = client.get_component(ResizeEventRecorder)
+        rectangle = client.get_component(rio.Rectangle)
+
+        layouter = await Layouter.create(client.session)
+        recorder_layout = layouter.get_layout_is(resize_event_recorder)
+        rectangle_layout = layouter.get_layout_is(rectangle)
+        assert (
+            recorder_layout.allocated_outer_width
+            == rectangle_layout.allocated_outer_width
+        )
+        assert (
+            recorder_layout.allocated_outer_height
+            == rectangle_layout.allocated_outer_height
+        )
+
+        event = resize_event_recorder.recorded_events[-1]
+        assert event.width == recorder_layout.allocated_outer_width
+        assert event.height == recorder_layout.allocated_outer_height

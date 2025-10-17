@@ -1,4 +1,11 @@
-import { markEventAsHandled, stopPropagation } from "./eventHandling";
+import { TextStyle } from "./dataModels";
+import { applyTextStyleCss, textStyleToCss } from "./cssUtils";
+import {
+    markEventAsHandled,
+    stopPropagation,
+    stopLeftButtonPropagation,
+    markLeftButtonAsHandled,
+} from "./eventHandling";
 
 export type InputBoxStyle = "underlined" | "rounded" | "pill";
 
@@ -135,18 +142,24 @@ export class InputBox {
             this.focus();
         });
 
-        this.outerElement.addEventListener("pointerdown", stopPropagation);
-        this.outerElement.addEventListener("pointerup", stopPropagation);
-
         // Consider any clicks on the input box as handled. This prevents e.g.
         // drag events when trying to select something.
+        this.outerElement.addEventListener(
+            "pointerdown",
+            stopLeftButtonPropagation
+        );
+        this.outerElement.addEventListener(
+            "pointerup",
+            stopLeftButtonPropagation
+        );
+
         this.prefixTextElement.addEventListener(
             "pointerdown",
-            markEventAsHandled
+            markLeftButtonAsHandled
         );
         this.suffixElementContainer.addEventListener(
             "pointerdown",
-            markEventAsHandled
+            markLeftButtonAsHandled
         );
 
         // When clicked, focus the text element and move the cursor accordingly.
@@ -178,7 +191,10 @@ export class InputBox {
         // Pointer down events select the input element and/or text in it (via
         // dragging), so let them do their default behavior but then stop them
         // from propagating to other elements
-        this._inputElement.addEventListener("pointerdown", stopPropagation);
+        this._inputElement.addEventListener(
+            "pointerdown",
+            stopLeftButtonPropagation
+        );
     }
 
     private _hasDefaultHandler(event: KeyboardEvent): boolean {
@@ -303,6 +319,11 @@ export class InputBox {
         );
 
         this.outerElement.classList.add(`rio-input-box-style-${style}`);
+    }
+
+    set textStyle(style: TextStyle) {
+        let textStyleCss = textStyleToCss(style);
+        applyTextStyleCss(this._inputElement, textStyleCss);
     }
 
     get isSensitive(): boolean {

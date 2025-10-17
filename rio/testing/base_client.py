@@ -26,6 +26,7 @@ class BaseClient(abc.ABC):
         *,
         running_in_window: bool = False,
         user_settings: JsonDoc = {},
+        cookies: t.Mapping[str, str] = {},
         active_url: str = "/",
         debug_mode: bool = False,
     ): ...
@@ -39,6 +40,7 @@ class BaseClient(abc.ABC):
         default_attachments: t.Iterable[object] = (),
         running_in_window: bool = False,
         user_settings: JsonDoc = {},
+        cookies: t.Mapping[str, str] = {},
         active_url: str = "/",
         debug_mode: bool = False,
     ): ...
@@ -53,6 +55,7 @@ class BaseClient(abc.ABC):
         default_attachments: t.Iterable[object] = (),
         running_in_window: bool = False,
         user_settings: JsonDoc = {},
+        cookies: t.Mapping[str, str] = {},
         active_url: str = "/",
         debug_mode: bool = False,
     ):
@@ -69,11 +72,13 @@ class BaseClient(abc.ABC):
                 app = rio.App(
                     build=build,
                     name=app_name,
+                    theme=rio.Theme.pair_from_colors(),
                     default_attachments=tuple(default_attachments),
                 )
 
         self._app = app
         self._user_settings = user_settings
+        self._cookies = cookies
         self._active_url = active_url
         self._running_in_window = running_in_window
         self._debug_mode = debug_mode
@@ -185,19 +190,39 @@ class BaseClient(abc.ABC):
         component_type: type[C] = rio.Component,
         key: Key | None = None,
     ) -> t.Iterator[C]:
-        roots = [self.root_component]
+        to_do = [self.root_component]
+        to_do.extend(
+            dialog._root_component
+            for dialog in self.session._fundamental_root_component._owned_dialogs_.values()
+        )
+        seen = set[rio.Component]()
 
-        for root_component in roots:
-            for component in root_component._iter_component_tree_():
-                if isinstance(component, component_type) and (
-                    key is None or key == component.key
-                ):
-                    yield component
+        while to_do:
+            component = to_do.pop()
 
-                roots.extend(
-                    dialog._root_component
-                    for dialog in component._owned_dialogs_.values()
+            if component in seen:
+                continue
+            seen.add(component)
+
+            # Yield matching components
+            if isinstance(component, component_type) and (
+                key is None or key == component.key
+            ):
+                yield component
+
+            # Queue the component's children
+            to_do.extend(component._iter_direct_children_in_attributes_())
+            to_do.extend(
+                component._iter_tree_children_(
+                    include_self=False,
+                    recurse_into_fundamental_components=False,
+                    recurse_into_high_level_components=False,
                 )
+            )
+            to_do.extend(
+                dialog._root_component
+                for dialog in component._owned_dialogs_.values()
+            )
 
     def get_component(
         self,

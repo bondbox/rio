@@ -1,4 +1,4 @@
-@import "../utils";
+@use "../utils";
 
 .rio-revealer {
     pointer-events: auto;
@@ -46,7 +46,11 @@
 .rio-revealer-content-inner {
     position: relative;
 
-    @include single-container();
+    // Make sure to fill the parent element
+    min-width: 100%;
+    min-height: 100%;
+
+    @include utils.single-container();
 
     opacity: 0;
     transform: translateY(-50%);

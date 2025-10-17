@@ -13,6 +13,7 @@ import types
 import typing as t
 
 import introspection.types
+import typing_extensions as te
 import uniserde
 from uniserde import Jsonable, JsonDoc
 
@@ -23,7 +24,11 @@ from .components import fundamental_component
 from .observables.dataclass import class_local_fields
 from .self_serializing import SelfSerializing
 
-__all__ = ["serialize_json", "serialize_and_host_component"]
+__all__ = [
+    "serialize_json",
+    "serialize_and_host_component",
+    "get_all_serializable_property_names",
+]
 
 
 T = t.TypeVar("T")
@@ -80,7 +85,7 @@ def serialize_json(data: Jsonable) -> str:
 
 
 def serialize_and_host_component(
-    component: rio.Component, changed_properties: t.Iterable[str]
+    component: rio.Component, properties_to_serialize: t.Iterable[str]
 ) -> JsonDoc:
     """
     Serializes the component, non-recursively. Children are serialized just by
@@ -147,7 +152,7 @@ def serialize_and_host_component(
         sess = component.session
         serializers = get_attribute_serializers(type(component))
 
-        for name in changed_properties:
+        for name in properties_to_serialize:
             try:
                 serializer = serializers[name]
             except KeyError:
@@ -177,6 +182,9 @@ def serialize_and_host_component(
         # user-defined state is also added and could clash
         result["_type_"] = "HighLevelComponent-builtin"
         result["_child_"] = component._build_data_.build_result._id_  # type: ignore
+
+    if rio.event.EventTag.ON_RESIZE in component._rio_event_handlers_:
+        result["_report_resize_"] = True
 
     return result
 
@@ -214,6 +222,9 @@ def get_attribute_serializers(
         serializers[attr_name] = serializer
 
     return serializers
+
+
+get_all_serializable_property_names = get_attribute_serializers
 
 
 def _serialize_basic_json_value(
@@ -303,7 +314,7 @@ def _get_serializer_for_annotation(
             return functools.partial(_serialize_enum, as_type=annotation)
 
     # Sequences of serializable values
-    if origin in (list, t.Sequence, collections.abc.Sequence):
+    if origin in (list, collections.abc.Sequence, t.Sequence, te.Sequence):
         item_serializer = _get_serializer_for_annotation(args[0])
         if item_serializer is None:
             return None
@@ -313,10 +324,10 @@ def _get_serializer_for_annotation(
         )
 
     # Literal
-    if origin is t.Literal:
+    if origin in (t.Literal, te.Literal):
         return _serialize_basic_json_value
 
-    if origin in (t.Union, types.UnionType):
+    if origin in (t.Union, te.Union, types.UnionType):
         # ColorSet
         if set(args) == color._color_set_args:
             return _serialize_colorset
