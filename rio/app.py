@@ -163,6 +163,7 @@ class App:
     description: str
     assets_dir: Path
     pages: t.Sequence[rio.ComponentPage | rio.Redirect]
+    paths: t.Sequence[rio.Route]
     meta_tags: dict[str, str]
 
     def __init__(
@@ -173,6 +174,10 @@ class App:
         description: str | None = None,
         icon: ImageLike | None = None,
         pages: t.Iterable[rio.ComponentPage | rio.Redirect]
+        | os.PathLike
+        | str
+        | None = None,
+        paths: t.Iterable[rio.Route]
         | os.PathLike
         | str
         | None = None,
@@ -323,10 +328,20 @@ class App:
         else:
             pages = list(pages)
 
+        if paths is None:
+            paths = self._infer_paths()
+        elif isinstance(paths, (os.PathLike, str)):
+            paths = routing.auto_detect_paths(
+                self._base_dir_for_relative_paths / paths
+            )
+        else:
+            paths = list(paths)
+
         self.name = name
         self.description = description
         self.assets_dir = assets_dir
         self.pages = pages
+        self.paths = paths
         self._build = build
         self._icon = assets.Asset.from_image(icon)
         self._on_app_start = on_app_start
@@ -589,6 +604,40 @@ class App:
             package_name = "pages"
 
         return routing.auto_detect_pages(pages_dir, package=package_name)
+
+    def _infer_paths(self) -> list[rio.Route]:
+        paths_dir = self._base_dir_for_relative_paths / "paths"
+
+        # No `pages` folder exists? No pages, then.
+        if not paths_dir.exists():
+            return []
+
+        # In order to import the pages correctly correctly we must know the
+        # correct module name to use. We know that the `pages` folder is a
+        # sibling of `self._calling_module`, so we can deduce the correct module
+        # name based on that.
+        if self._calling_module.__file__ is None:
+            # TODO: Display a warning?
+            return []
+
+        caller_file_path = Path(self._calling_module.__file__)
+
+        # Careful: If the calling file is the `__init__.py` of a package, the
+        # `__init__` part is not included in the module's `__name__`.
+        if (
+            caller_file_path.name == "__init__.py"
+            and self._calling_module.__name__.rpartition(".")[2] != "__init__"
+        ):
+            package_name = self._calling_module.__name__
+        else:
+            package_name = self._calling_module.__name__.rpartition(".")[0]
+
+        if package_name:
+            package_name += ".paths"
+        else:
+            package_name = "paths"
+
+        return routing.auto_detect_paths(paths_dir, package=package_name)
 
     def _iter_page_urls(
         self,

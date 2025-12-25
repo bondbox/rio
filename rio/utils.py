@@ -587,6 +587,10 @@ def safe_build(
     return placeholder_component
 
 
+def is_python_dir(path: Path) -> bool:
+    return path.stem in ("__pycache__")
+
+
 def is_python_script(path: Path) -> bool:
     """
     Guesses whether the path points to a Python script, based on the path's file
